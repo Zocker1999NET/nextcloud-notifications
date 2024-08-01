@@ -24,19 +24,21 @@ declare(strict_types=1);
 
 namespace OCA\Notifications;
 
-use GuzzleHttp\Exception\ClientException;
-use GuzzleHttp\Exception\ServerException;
 use OC\Authentication\Exceptions\InvalidTokenException;
 use OC\Authentication\Token\IProvider;
 use OC\Security\IdentityProof\Key;
 use OC\Security\IdentityProof\Manager;
-use OCP\AppFramework\Http;
-use OCP\DB\QueryBuilder\IQueryBuilder;
+use OCA\Notifications\Data\NotificationArgs;
+use OCA\Notifications\Data\NotificationDeleteSet;
+use OCA\Notifications\Data\NotificationSet;
+use OCA\Notifications\Data\Payload;
+use OCA\Notifications\Data\PushArgs;
+use OCA\Notifications\Devices\AllDeviceManager;
+use OCA\Notifications\Devices\Device;
 use OCP\Http\Client\IClientService;
 use OCP\ICache;
 use OCP\ICacheFactory;
 use OCP\IConfig;
-use OCP\IDBConnection;
 use OCP\IUser;
 use OCP\L10N\IFactory;
 use OCP\Notification\IManager as INotificationManager;
@@ -48,8 +50,11 @@ use Psr\Log\LoggerInterface;
 use Symfony\Component\Console\Output\OutputInterface;
 
 class Push {
-	/** @var IDBConnection */
-	protected $db;
+	// We don't push to devices that are older than 60 days
+	public const TOKEN_MAX_AGE = 60 * 24 * 60 * 60;
+
+	/** @var AllDeviceManager */
+	protected AllDeviceManager $deviceManager;
 	/** @var INotificationManager */
 	protected $notificationManager;
 	/** @var IConfig */
@@ -70,8 +75,8 @@ class Push {
 	protected $log;
 	/** @var OutputInterface */
 	protected $output;
-	/** @var array */
-	protected $payloadsToSend = [];
+	/** @var Payload[] */
+	protected array $payloadsToSend = [];
 
 	/** @var bool */
 	protected $deferPreparing = false;
@@ -99,17 +104,19 @@ class Push {
 		'twofactor_nextcloud_notification' => true,
 	];
 
-	public function __construct(IDBConnection $connection,
-								INotificationManager $notificationManager,
-								IConfig $config,
-								IProvider $tokenProvider,
-								Manager $keyManager,
-								IClientService $clientService,
-								ICacheFactory $cacheFactory,
-								IUserStatusManager $userStatusManager,
-								IFactory $l10nFactory,
-								LoggerInterface $log) {
-		$this->db = $connection;
+	public function __construct(
+		AllDeviceManager $targetManager,
+		INotificationManager $notificationManager,
+		IConfig $config,
+		IProvider $tokenProvider,
+		Manager $keyManager,
+		IClientService $clientService,
+		ICacheFactory $cacheFactory,
+		IUserStatusManager $userStatusManager,
+		IFactory $l10nFactory,
+		LoggerInterface $log,
+	) {
+		$this->deviceManager = $targetManager;
 		$this->notificationManager = $notificationManager;
 		$this->config = $config;
 		$this->tokenProvider = $tokenProvider;
@@ -126,9 +133,7 @@ class Push {
 	}
 
 	protected function printInfo(string $message): void {
-		if ($this->output) {
-			$this->output->writeln($message);
-		}
+		$this->output?->writeln($message);
 	}
 
 	public function isDeferring(): bool {
@@ -146,7 +151,7 @@ class Push {
 		if (!empty($this->loadDevicesForUsers)) {
 			$this->loadDevicesForUsers = array_unique($this->loadDevicesForUsers);
 			$missingDevicesFor = array_diff($this->loadDevicesForUsers, array_keys($this->userDevices));
-			$newUserDevices = $this->getDevicesForUsers($missingDevicesFor);
+			$newUserDevices = $this->deviceManager->getDevicesForUserList($missingDevicesFor);
 			foreach ($missingDevicesFor as $userId) {
 				$this->userDevices[$userId] = $newUserDevices[$userId] ?? [];
 			}
@@ -178,17 +183,22 @@ class Push {
 		}
 
 		$this->deferPayloads = false;
-		$this->sendNotificationsToProxies();
+		$this->sendNotifications();
 	}
 
+	/**
+	 * @param Device[] $devices
+	 * @param string $app
+	 * @return Device[]
+	 */
 	public function filterDeviceList(array $devices, string $app): array {
 		$isTalkNotification = \in_array($app, ['spreed', 'talk', 'admin_notification_talk'], true);
 
 		$talkDevices = array_filter($devices, static function ($device) {
-			return $device['apptype'] === 'talk';
+			return $device->isAppType('talk');
 		});
 		$otherDevices = array_filter($devices, static function ($device) {
-			return $device['apptype'] !== 'talk';
+			return !$device->isAppType('talk');
 		});
 
 		$this->printInfo('Identified ' . count($talkDevices) . ' Talk devices and ' . count($otherDevices) . ' others.');
@@ -210,13 +220,13 @@ class Push {
 		return $talkDevices;
 	}
 
-	public function pushToDevice(int $id, INotification $notification, ?OutputInterface $output = null): void {
-		if (!$this->config->getSystemValueBool('has_internet_connection', true)) {
+	public function pushToDevice(int $notificationId, INotification $notification): void {
+		if (!$this->hasInternetConnection()) {
 			return;
 		}
 
 		if ($this->deferPreparing) {
-			$this->notificationsToPush[$id] = clone $notification;
+			$this->notificationsToPush[$notificationId] = clone $notification;
 			$this->loadDevicesForUsers[] = $notification->getUser();
 			$this->loadStatusForUsers[] = $notification->getUser();
 			return;
@@ -224,28 +234,12 @@ class Push {
 
 		$user = $this->createFakeUserObject($notification->getUser());
 
-		if (!array_key_exists($notification->getUser(), $this->userStatuses)) {
-			$userStatus = $this->userStatusManager->getUserStatuses([
-				$notification->getUser(),
-			]);
-
-			$this->userStatuses[$notification->getUser()] = $userStatus[$notification->getUser()] ?? null;
+		if (!$this->isNotificationAllowed($notification)) {
+			$this->printInfo('<error>User status is set to DND - no push notifications will be sent</error>');
+			return;
 		}
 
-		if (isset($this->userStatuses[$notification->getUser()])) {
-			$userStatus = $this->userStatuses[$notification->getUser()];
-			if ($userStatus->getStatus() === IUserStatus::DND && empty($this->allowedDNDPushList[$notification->getApp()])) {
-				$this->printInfo('<error>User status is set to DND - no push notifications will be sent</error>');
-				return;
-			}
-		}
-
-		if (!array_key_exists($notification->getUser(), $this->userDevices)) {
-			$devices = $this->getDevicesForUser($notification->getUser());
-			$this->userDevices[$notification->getUser()] = $devices;
-		} else {
-			$devices = $this->userDevices[$notification->getUser()];
-		}
+		$devices = $this->loadUserDevices($notification->getUser());
 
 		if (empty($devices)) {
 			$this->printInfo('No devices found for user');
@@ -278,40 +272,42 @@ class Push {
 			return;
 		}
 
-		// We don't push to devices that are older than 60 days
-		$maxAge = time() - 60 * 24 * 60 * 60;
+		$maxAge = time() - self::TOKEN_MAX_AGE;
+		$notificationSet = new NotificationSet(
+			$notificationId,
+			$notification,
+			$isTalkNotification,
+		);
+		$args = new NotificationArgs(
+			$userKey,
+			$this->log,
+		);
 
 		foreach ($devices as $device) {
-			$device['token'] = (int) $device['token'];
 			$this->printInfo('');
-			$this->printInfo('Device token:' . $device['token']);
+			$this->printInfo('Device token:' . $device->getToken());
 
-			if (!$this->validateToken($device['token'], $maxAge)) {
+			if (!$this->validateToken($device->getToken(), $maxAge)) {
 				// Token does not exist anymore
 				continue;
 			}
 
 			try {
-				$payload = json_encode($this->encryptAndSign($userKey, $device, $id, $notification, $isTalkNotification));
-
-				$proxyServer = rtrim($device['proxyserver'], '/');
-				if (!isset($this->payloadsToSend[$proxyServer])) {
-					$this->payloadsToSend[$proxyServer] = [];
-				}
-				$this->payloadsToSend[$proxyServer][] = $payload;
+				$payload = $device->generatePayloadForNotification($notificationSet, $args);
+				$this->payloadsToSend[] = $payload;
 			} catch (\InvalidArgumentException $e) {
 				// Failed to encrypt message for device: public key is invalid
-				$this->deletePushToken($device['token']);
+				$this->deviceManager->deleteByToken($device->getToken());
 			}
 		}
 
 		if (!$this->deferPayloads) {
-			$this->sendNotificationsToProxies();
+			$this->sendNotifications();
 		}
 	}
 
 	public function pushDeleteToDevice(string $userId, int $notificationId, string $app = ''): void {
-		if (!$this->config->getSystemValueBool('has_internet_connection', true)) {
+		if (!$this->hasInternetConnection()) {
 			return;
 		}
 
@@ -323,14 +319,15 @@ class Push {
 
 		$user = $this->createFakeUserObject($userId);
 
-		if (!array_key_exists($userId, $this->userDevices)) {
-			$devices = $this->getDevicesForUser($userId);
-			$this->userDevices[$userId] = $devices;
-		} else {
-			$devices = $this->userDevices[$userId];
-		}
+		$devices = $this->loadUserDevices($userId);
 
-		if ($notificationId !== 0 && $app !== '') {
+		$deleteSet = new NotificationDeleteSet(
+			$userId,
+			$notificationId,
+			$app,
+		);
+
+		if (!$deleteSet->isDeleteAll() && $app !== '') {
 			// Only filter when it's not a single delete
 			$devices = $this->filterDeviceList($devices, $app);
 		}
@@ -338,134 +335,68 @@ class Push {
 			return;
 		}
 
-		// We don't push to devices that are older than 60 days
-		$maxAge = time() - 60 * 24 * 60 * 60;
+		$maxAge = time() - self::TOKEN_MAX_AGE;
+		$args = new NotificationArgs(
+			$this->keyManager->getKey($user),
+			$this->log,
+		);
 
-		$userKey = $this->keyManager->getKey($user);
 		foreach ($devices as $device) {
-			$device['token'] = (int) $device['token'];
-			if (!$this->validateToken($device['token'], $maxAge)) {
+			if (!$this->validateToken($device->getToken(), $maxAge)) {
 				// Token does not exist anymore
 				continue;
 			}
 
 			try {
-				$payload = json_encode($this->encryptAndSignDelete($userKey, $device, $notificationId));
-
-				$proxyServer = rtrim($device['proxyserver'], '/');
-				if (!isset($this->payloadsToSend[$proxyServer])) {
-					$this->payloadsToSend[$proxyServer] = [];
-				}
-				$this->payloadsToSend[$proxyServer][] = $payload;
+				$payload = $device->generatePayloadForDelete($deleteSet, $args);
+				$this->payloadsToSend[] = $payload;
 			} catch (\InvalidArgumentException $e) {
 				// Failed to encrypt message for device: public key is invalid
-				$this->deletePushToken($device['token']);
+				$this->deviceManager->deleteByToken($device->getToken());
 			}
 		}
 
 		if (!$this->deferPayloads) {
-			$this->sendNotificationsToProxies();
+			$this->sendNotifications();
 		}
 	}
 
-	protected function sendNotificationsToProxies(): void {
-		$pushNotifications = $this->payloadsToSend;
+	protected function sendNotifications(): void {
+		$payloadsToSend = $this->payloadsToSend;
 		$this->payloadsToSend = [];
-		if (empty($pushNotifications)) {
+		if (empty($payloadsToSend)) {
 			return;
 		}
-
-		if (!$this->notificationManager->isFairUseOfFreePushService()) {
-			/**
-			 * We want to keep offering our push notification service for free, but large
-			 * users overload our infrastructure. For this reason we have to rate-limit the
-			 * use of push notifications. If you need this feature, consider using Nextcloud Enterprise.
-			 */
-			return;
-		}
-
+		// sort by target key to group them together
+		usort($payloadsToSend, function (Payload $a, Payload $b) {
+			return $a->getTargetKey() <=> $b->getTargetKey();
+		});
+		$pushArgs = new PushArgs(
+			$this->config,
+			$this->output,
+			$this->log,
+			$this->deviceManager,
+			$this->notificationManager,
+		);
 		$client = $this->clientService->newClient();
-		foreach ($pushNotifications as $proxyServer => $notifications) {
-			try {
-				$requestData = [
-					'body' => [
-						'notifications' => $notifications,
-					],
-				];
-
-				if ($proxyServer === 'https://push-notifications.nextcloud.com') {
-					$subscriptionKey = $this->config->getAppValue('support', 'subscription_key');
-					if ($subscriptionKey) {
-						$requestData['headers']['X-Nextcloud-Subscription-Key'] = $subscriptionKey;
-					}
-				}
-
-				$response = $client->post($proxyServer . '/notifications', $requestData);
-				$status = $response->getStatusCode();
-				$body = $response->getBody();
-				$bodyData = json_decode($body, true);
-			} catch (ClientException $e) {
-				// Server responded with 4xx (400 Bad Request mostlikely)
-				$response = $e->getResponse();
-				$status = $response->getStatusCode();
-				$body = $response->getBody()->getContents();
-				$bodyData = json_decode($body, true);
-			} catch (ServerException $e) {
-				// Server responded with 5xx
-				$response = $e->getResponse();
-				$body = $response->getBody()->getContents();
-				$error = \is_string($body) ? $body : ('no reason given (' . $response->getStatusCode() . ')');
-
-				$this->log->debug('Could not send notification to push server [{url}]: {error}', [
-					'error' => $error,
-					'url' => $proxyServer,
-					'app' => 'notifications',
-				]);
-
-				$this->printInfo('Could not send notification to push server [' . $proxyServer . ']: ' . $error);
-				continue;
-			} catch (\Exception $e) {
-				$this->log->error($e->getMessage(), [
-					'exception' => $e,
-				]);
-
-				$error = $e->getMessage() ?: 'no reason given';
-				$this->printInfo('Could not send notification to push server [' . get_class($e) . ']: ' . $error);
+		$lastPusher = null;
+		foreach ($payloadsToSend as $pusher) {
+			if (is_null($lastPusher)) {
+				$lastPusher = $pusher;
 				continue;
 			}
-
-			if (is_array($bodyData) && array_key_exists('unknown', $bodyData) && array_key_exists('failed', $bodyData)) {
-				if (is_array($bodyData['unknown'])) {
-					// Proxy returns null when the array is empty
-					foreach ($bodyData['unknown'] as $unknownDevice) {
-						$this->printInfo('Deleting device because it is unknown by the push server: ' . $unknownDevice);
-						$this->deletePushTokenByDeviceIdentifier($unknownDevice);
-					}
+			$combined = $lastPusher->groupWith($pusher);
+			if (is_null($combined)) {
+				$lastPusher->send($client, $pushArgs);
+				if ($lastPusher->getTargetKey() !== $pusher->getTargetKey()) {
+					$client = $this->clientService->newClient();
 				}
-
-				if ($bodyData['failed'] !== 0) {
-					$this->printInfo('Push notification sent, but ' . $bodyData['failed'] . ' failed');
-				} else {
-					$this->printInfo('Push notification sent successfully');
-				}
-			} elseif ($status !== Http::STATUS_OK) {
-				$error = $body && $bodyData === null ? $body : 'no reason given';
-				$this->printInfo('Could not send notification to push server [' . $proxyServer . ']: ' . $error);
-				$this->log->warning('Could not send notification to push server [{url}]: {error}', [
-					'error' => $error,
-					'url' => $proxyServer,
-					'app' => 'notifications',
-				]);
+				$lastPusher = $pusher;
 			} else {
-				$error = $body && $bodyData === null ? $body : 'no reason given';
-				$this->printInfo('Push notification sent but response was not parsable, using an outdated push proxy? [' . $proxyServer . ']: ' . $error);
-				$this->log->info('Push notification sent but response was not parsable, using an outdated push proxy? [{url}]: {error}', [
-					'error' => $error,
-					'url' => $proxyServer,
-					'app' => 'notifications',
-				]);
+				$lastPusher = $combined;
 			}
 		}
+		$lastPusher->send($client, $pushArgs);
 	}
 
 	protected function validateToken(int $tokenId, int $maxAge): bool {
@@ -487,180 +418,58 @@ class Push {
 		} catch (InvalidTokenException $e) {
 			// Token does not exist anymore, should drop the push device entry
 			$this->printInfo('InvalidTokenException is thrown');
-			$this->deletePushToken($tokenId);
+			$this->deviceManager->deleteByToken($tokenId);
 			$this->cache->set('t' . $tokenId, 0, 600);
 			return false;
 		}
 	}
 
 	/**
-	 * @param Key $userKey
-	 * @param array $device
-	 * @param int $id
+	 * Loads devices for given user.
+	 *
+	 * This method caches the results.
+	 *
+	 * @param string $userId
+	 * @return Device[]
+	 */
+	protected function loadUserDevices(string $userId): array {
+		if (!array_key_exists($userId, $this->userDevices)) {
+			$devices = $this->deviceManager->getDevicesForUser($userId);
+			$this->userDevices[$userId] = $devices;
+		} else {
+			$devices = $this->userDevices[$userId];
+		}
+		return $devices;
+	}
+
+	/**
+	 * Checks if the notification is allowed to be sent depending on the user's DND status.
+	 *
 	 * @param INotification $notification
-	 * @param bool $isTalkNotification
-	 * @return array
-	 * @throws InvalidTokenException
-	 * @throws \InvalidArgumentException
+	 * @return bool If notification is allowed to be sent
 	 */
-	protected function encryptAndSign(Key $userKey, array $device, int $id, INotification $notification, bool $isTalkNotification): array {
-		$data = [
-			'nid' => $id,
-			'app' => $notification->getApp(),
-			'subject' => '',
-			'type' => $notification->getObjectType(),
-			'id' => $notification->getObjectId(),
-		];
+	protected function isNotificationAllowed(INotification $notification): bool {
+		return !$this->isUserDND($notification->getUser()) ||
+			!empty($this->allowedDNDPushList[$notification->getApp()]);
+	}
 
-		// Max length of encryption is ~240, so we need to make sure the subject is shorter.
-		// Also, subtract two for encapsulating quotes will be added.
-		$maxDataLength = 200 - strlen(json_encode($data)) - 2;
-		$data['subject'] = Util::shortenMultibyteString($notification->getParsedSubject(), $maxDataLength);
-		if ($notification->getParsedSubject() !== $data['subject']) {
-			$data['subject'] .= '…';
-		}
+	protected function isUserDND(string $userId): bool {
+		return $this->loadUserStatus($userId)?->getStatus() === IUserStatus::DND ?? false;
+	}
 
-		if ($isTalkNotification) {
-			$priority = 'high';
-			$type = $data['type'] === 'call' ? 'voip' : 'alert';
-		} elseif ($data['app'] === 'twofactor_nextcloud_notification' || $data['app'] === 'phonetrack') {
-			$priority = 'high';
-			$type = 'alert';
+	protected function loadUserStatus(string $userId): ?IUserStatus {
+		if (array_key_exists($userId, $this->userStatuses)) {
+			$userStatus = $this->userStatuses[$userId];
 		} else {
-			$priority = 'normal';
-			$type = 'alert';
+			$userStatuses = $this->userStatusManager->getUserStatuses([$userId]);
+			$userStatus = $userStatuses[$userId] ?? null;
+			$this->userStatuses[$userId] = $userStatus;
 		}
-
-		$this->printInfo('Device public key size: ' . strlen($device['devicepublickey']));
-		$this->printInfo('Data to encrypt is: ' . json_encode($data));
-
-		if (!openssl_public_encrypt(json_encode($data), $encryptedSubject, $device['devicepublickey'], OPENSSL_PKCS1_PADDING)) {
-			$error = openssl_error_string();
-			$this->log->error($error, ['app' => 'notifications']);
-			$this->printInfo('Error while encrypting data: "' . $error . '"');
-			throw new \InvalidArgumentException('Failed to encrypt message for device');
-		}
-
-		if (openssl_sign($encryptedSubject, $signature, $userKey->getPrivate(), OPENSSL_ALGO_SHA512)) {
-			$this->printInfo('Signed encrypted push subject');
-		} else {
-			$this->printInfo('Failed to signed encrypted push subject');
-		}
-		$base64EncryptedSubject = base64_encode($encryptedSubject);
-		$base64Signature = base64_encode($signature);
-
-		return [
-			'deviceIdentifier' => $device['deviceidentifier'],
-			'pushTokenHash' => $device['pushtokenhash'],
-			'subject' => $base64EncryptedSubject,
-			'signature' => $base64Signature,
-			'priority' => $priority,
-			'type' => $type,
-		];
+		return $userStatus;
 	}
 
-	/**
-	 * @param Key $userKey
-	 * @param array $device
-	 * @param int $id
-	 * @return array
-	 * @throws InvalidTokenException
-	 * @throws \InvalidArgumentException
-	 */
-	protected function encryptAndSignDelete(Key $userKey, array $device, int $id): array {
-		if ($id === 0) {
-			$data = [
-				'delete-all' => true,
-			];
-		} else {
-			$data = [
-				'nid' => $id,
-				'delete' => true,
-			];
-		}
-
-		if (!openssl_public_encrypt(json_encode($data), $encryptedSubject, $device['devicepublickey'], OPENSSL_PKCS1_PADDING)) {
-			$this->log->error(openssl_error_string(), ['app' => 'notifications']);
-			throw new \InvalidArgumentException('Failed to encrypt message for device');
-		}
-
-		openssl_sign($encryptedSubject, $signature, $userKey->getPrivate(), OPENSSL_ALGO_SHA512);
-		$base64EncryptedSubject = base64_encode($encryptedSubject);
-		$base64Signature = base64_encode($signature);
-
-		return [
-			'deviceIdentifier' => $device['deviceidentifier'],
-			'pushTokenHash' => $device['pushtokenhash'],
-			'subject' => $base64EncryptedSubject,
-			'signature' => $base64Signature,
-			'priority' => 'normal',
-			'type' => 'background',
-		];
-	}
-
-	/**
-	 * @param string $uid
-	 * @return array[]
-	 */
-	protected function getDevicesForUser(string $uid): array {
-		$query = $this->db->getQueryBuilder();
-		$query->select('*')
-			->from('notifications_pushhash')
-			->where($query->expr()->eq('uid', $query->createNamedParameter($uid)));
-
-		$result = $query->executeQuery();
-		$devices = $result->fetchAll();
-		$result->closeCursor();
-
-		return $devices;
-	}
-
-	/**
-	 * @param string[] $userIds
-	 * @return array[]
-	 */
-	protected function getDevicesForUsers(array $userIds): array {
-		$query = $this->db->getQueryBuilder();
-		$query->select('*')
-			->from('notifications_pushhash')
-			->where($query->expr()->in('uid', $query->createNamedParameter($userIds, IQueryBuilder::PARAM_STR_ARRAY)));
-
-		$devices = [];
-		$result = $query->executeQuery();
-		while ($row = $result->fetch()) {
-			if (!isset($devices[$row['uid']])) {
-				$devices[$row['uid']] = [];
-			}
-			$devices[$row['uid']][] = $row;
-		}
-
-		$result->closeCursor();
-
-		return $devices;
-	}
-
-	/**
-	 * @param int $tokenId
-	 * @return bool
-	 */
-	protected function deletePushToken(int $tokenId): bool {
-		$query = $this->db->getQueryBuilder();
-		$query->delete('notifications_pushhash')
-			->where($query->expr()->eq('token', $query->createNamedParameter($tokenId, IQueryBuilder::PARAM_INT)));
-
-		return $query->executeStatement() !== 0;
-	}
-
-	/**
-	 * @param string $deviceIdentifier
-	 * @return bool
-	 */
-	protected function deletePushTokenByDeviceIdentifier(string $deviceIdentifier): bool {
-		$query = $this->db->getQueryBuilder();
-		$query->delete('notifications_pushhash')
-			->where($query->expr()->eq('deviceidentifier', $query->createNamedParameter($deviceIdentifier)));
-
-		return $query->executeStatement() !== 0;
+	private function hasInternetConnection(): bool {
+		return $this->config->getSystemValueBool('has_internet_connection', true);
 	}
 
 	protected function createFakeUserObject(string $userId): IUser {

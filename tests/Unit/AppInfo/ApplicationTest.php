@@ -26,7 +26,7 @@ use OCA\Notifications\App;
 use OCA\Notifications\AppInfo\Application;
 use OCA\Notifications\Capabilities;
 use OCA\Notifications\Controller\EndpointController;
-use OCA\Notifications\Controller\PushController;
+use OCA\Notifications\Controller\ProxyPushController;
 use OCA\Notifications\Handler;
 use OCA\Notifications\Push;
 use OCA\Notifications\Tests\Unit\TestCase;
@@ -70,8 +70,8 @@ class ApplicationTest extends TestCase {
 			// Controller/
 			[EndpointController::class],
 			[EndpointController::class, OCSController::class],
-			[PushController::class],
-			[PushController::class, OCSController::class],
+			[ProxyPushController::class],
+			[ProxyPushController::class, OCSController::class],
 		];
 	}
 

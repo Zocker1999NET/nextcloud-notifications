@@ -1,0 +1,12 @@
+general notification part:
+- shortening to certain length
+- preparing data encapsuled for mobile apps
+- setting priority
+- setting type
+
+device-specific part:
+- encrypting & signing data
+- embedding priority & type (either encrypted or plain)o
+
+ToDos Generale:
+- find out if apps (at least android) uses priority & type values (aside of being FCM values)

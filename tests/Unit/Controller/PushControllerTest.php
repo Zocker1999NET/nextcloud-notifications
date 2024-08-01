@@ -27,7 +27,7 @@ use OC\Authentication\Token\IProvider;
 use OC\Authentication\Token\IToken;
 use OC\Security\IdentityProof\Key;
 use OC\Security\IdentityProof\Manager;
-use OCA\Notifications\Controller\PushController;
+use OCA\Notifications\Controller\ProxyPushController;
 use OCA\Notifications\Tests\Unit\TestCase;
 use OCP\AppFramework\Http;
 use OCP\AppFramework\Http\DataResponse;
@@ -53,7 +53,7 @@ class PushControllerTest extends TestCase {
 
 	/** @var IUser|\PHPUnit_Framework_MockObject_MockObject */
 	protected $user;
-	/** @var PushController */
+	/** @var ProxyPushController */
 	protected $controller;
 
 	protected $devicePublicKey = '-----BEGIN PUBLIC KEY-----
@@ -121,7 +121,7 @@ FwIDAQAB
 
 	protected function getController(array $methods = []) {
 		if (empty($methods)) {
-			return new PushController(
+			return new ProxyPushController(
 				'notifications',
 				$this->request,
 				$this->db,
@@ -132,7 +132,7 @@ FwIDAQAB
 			);
 		}
 
-		return $this->getMockBuilder(PushController::class)
+		return $this->getMockBuilder(ProxyPushController::class)
 			->setConstructorArgs([
 				'notifications',
 				$this->request,

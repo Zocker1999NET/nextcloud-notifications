@@ -28,8 +28,10 @@ return [
 		['name' => 'Endpoint#getNotification', 'url' => '/api/{apiVersion}/notifications/{id}', 'verb' => 'GET', 'requirements' => ['apiVersion' => 'v(1|2)', 'id' => '\d+']],
 		['name' => 'Endpoint#deleteNotification', 'url' => '/api/{apiVersion}/notifications/{id}', 'verb' => 'DELETE', 'requirements' => ['apiVersion' => 'v(1|2)', 'id' => '\d+']],
 		['name' => 'Endpoint#deleteAllNotifications', 'url' => '/api/{apiVersion}/notifications', 'verb' => 'DELETE', 'requirements' => ['apiVersion' => 'v(1|2)']],
-		['name' => 'Push#registerDevice', 'url' => '/api/{apiVersion}/push', 'verb' => 'POST', 'requirements' => ['apiVersion' => 'v2']],
-		['name' => 'Push#removeDevice', 'url' => '/api/{apiVersion}/push', 'verb' => 'DELETE', 'requirements' => ['apiVersion' => 'v2']],
+		['name' => 'ProxyPush#registerDevice', 'url' => '/api/{apiVersion}/push', 'verb' => 'POST', 'requirements' => ['apiVersion' => 'v2']],
+		['name' => 'ProxyPush#removeDevice', 'url' => '/api/{apiVersion}/push', 'verb' => 'DELETE', 'requirements' => ['apiVersion' => 'v2']],
+		['name' => 'UnifiedPush#registerDevice', 'url' => '/api/{apiVersion}/unified_push', 'verb' => 'POST', 'requirements' => ['apiVersion' => 'v2']],
+		['name' => 'UnifiedPush#removeDevice', 'url' => '/api/{apiVersion}/unified_push', 'verb' => 'DELETE', 'requirements' => ['apiVersion' => 'v2']],
 
 		['name' => 'API#generateNotification', 'url' => '/api/{apiVersion}/admin_notifications/{userId}', 'verb' => 'POST', 'requirements' => ['apiVersion' => 'v(1|2)']],
 
